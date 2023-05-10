@@ -1,0 +1,504 @@
+//si7021
+#include <Wire.h>
+#define si7021Addr 0x40
+
+// pH 
+#include "DFRobot_ESP_PH.h"
+#include "EEPROM.h" 
+
+DFRobot_ESP_PH ph;
+#define ESPADC 4096.0   //the esp Analog Digital Convertion value
+#define ESPVOLTAGE 3300 //the esp voltage supply value
+#define PH_PIN 35		//the esp gpio data pin number
+float voltage, phValue, temperature = 25;
+
+///dsb1820
+#include <OneWire.h> //sivi sicaklik
+#include <DallasTemperature.h>
+
+#define ONE_WIRE_BUS 17 //p17
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+///MQ135 
+#include <MQUnifiedsensor.h>
+
+#define placa "Arduino UNO"
+#define Voltage_Resolution 3.3
+#define pin 34 //Analog input 0 of your arduino
+#define ADC_Bit_Resolution 12 // For arduino UNO/MEGA/NANO
+#define RatioMQ135CleanAir 3.6//RS / R0 = 3.6 ppm 
+  
+MQUnifiedsensor MQ135(placa, Voltage_Resolution, ADC_Bit_Resolution, pin, "MQ-135");
+
+//TDS DEFINE
+
+#define TdsSensorPin 33
+#define VREF 3.3  // analog reference voltage(Volt) of the ADC
+#define SCOUNT 5  // sum of sample point
+
+int analogBuffer[SCOUNT];  // store the analog value in the array, read from ADC
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0;
+int copyIndex = 0;
+
+float averageVoltage = 0;
+float tdsValue = 0;
+
+//KONTROL RELAY
+#define FAN 16
+#define SU 4
+#define GUBRE 0
+#define PH 2
+
+int sayac = 0;
+
+// median filtering algorithm
+int getMedianNum(int bArray[], int iFilterLen) {  
+  int bTab[iFilterLen];
+  for (byte i = 0; i < iFilterLen; i++)
+    bTab[i] = bArray[i];
+  int i, j, bTemp;
+  for (j = 0; j < iFilterLen - 1; j++) {
+    for (i = 0; i < iFilterLen - j - 1; i++) {
+      if (bTab[i] > bTab[i + 1]) {
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
+      }
+    }
+  }
+  if ((iFilterLen & 1) > 0) {
+    bTemp = bTab[(iFilterLen - 1) / 2];
+  } else {
+    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+  }
+  return bTemp;
+}
+
+float tdsMtr(float si_sicaklik) {
+
+   temperature = si_sicaklik;
+  float compensationVoltage;
+  static unsigned long analogSampleTimepoint = millis();
+  if (millis() - analogSampleTimepoint > 5U) {  //every 40 milliseconds,read the analog value from the ADC
+    analogSampleTimepoint = millis();
+    analogBuffer[analogBufferIndex] = analogRead(TdsSensorPin);  //read the analog value and store into the buffer
+    analogBufferIndex++;
+    if (analogBufferIndex == SCOUNT) {
+      analogBufferIndex = 0;
+    }
+  }
+
+  static unsigned long printTimepoint = millis();
+  if (millis() - printTimepoint > 10U) {
+    printTimepoint = millis();
+    for (copyIndex = 0; copyIndex < SCOUNT; copyIndex++) {
+      analogBufferTemp[copyIndex] = analogBuffer[copyIndex];
+
+      // read the analog value more stable by the median filtering algorithm, and convert to voltage value
+      averageVoltage = getMedianNum(analogBufferTemp, SCOUNT) * (float)VREF / 4096.0;
+
+      //temperature compensation formula: fFinalResult(25^C) = fFinalResult(current)/(1.0+0.02*(fTP-25.0));
+      float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);
+      //temperature compensation
+      compensationVoltage = averageVoltage / compensationCoefficient;
+
+      //convert voltage value to tds value
+      tdsValue = (133.42 * compensationVoltage * compensationVoltage * compensationVoltage - 255.86 * compensationVoltage * compensationVoltage + 857.39 * compensationVoltage) * 0.5;
+
+      //Serial.print("voltage:");
+      //Serial.print(averageVoltage,2);
+      //Serial.print("V   ");
+    }
+  }
+
+  return tdsValue;
+}
+
+//_____________________
+
+#include <Arduino.h>
+#if defined(ESP32)
+  #include <WiFi.h>
+#elif defined(ESP8266)
+  #include <ESP8266WiFi.h>
+#endif
+#include <Firebase_ESP_Client.h>
+
+//Provide the token generation process info.
+#include "addons/TokenHelper.h"
+//Provide the RTDB payload printing info and other helper functions.
+#include "addons/RTDBHelper.h"
+
+// Insert your network credentials
+#define WIFI_SSID "wifi id"
+#define WIFI_PASSWORD "wifi password"
+
+// Insert Firebase project API Key
+#define API_KEY "AIzaSyD_TxEruZgAF2nk_7zkm6iZUdpAGT67gOQ"
+
+// Insert RTDB URLefine the RTDB URL */
+#define DATABASE_URL "https://y-3-s-2023-default-rtdb.firebaseio.com" 
+
+//Define Firebase Data object
+FirebaseData fbdo;
+
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long sendDataPrevMillis = 0;
+int count = 0;
+bool signupOK = false;
+
+
+float si7021_nem(){
+ 
+  unsigned int data[2];
+ 
+  Wire.beginTransmission(si7021Addr);
+  //Send humidity measurement command
+  Wire.write(0xF5);
+  Wire.endTransmission();
+  delay(500);
+
+  // Request 2 bytes of data
+  Wire.requestFrom(si7021Addr, 2);
+  // Read 2 bytes of data to get humidity
+  if(Wire.available() == 2)
+  {
+    data[0] = Wire.read();
+    data[1] = Wire.read();
+  }
+ 
+  // Convert the data
+  float humidity  = ((data[0] * 256.0) + data[1]);
+  humidity = ((125 * humidity) / 65536.0) - 6;
+
+  return humidity;
+
+}
+
+float si7021_sicaklik(){
+   
+  unsigned int data[2];
+
+   Wire.beginTransmission(si7021Addr);
+  // Send temperature measurement command
+  Wire.write(0xF3);
+  Wire.endTransmission();
+  delay(500);
+ 
+  // Request 2 bytes of data
+  Wire.requestFrom(si7021Addr, 2);
+ 
+  // Read 2 bytes of data for temperature
+  if(Wire.available() == 2)
+  {
+    data[0] = Wire.read();
+    data[1] = Wire.read();
+  }
+ 
+  // Convert the data
+  float temp  = ((data[0] * 256.0) + data[1]);
+  float celsTemp = ((175.72 * temp) / 65536.0) - 46.85;
+
+  return celsTemp;
+}
+
+float sivi_sicaklik(){
+
+   sensors.requestTemperatures(); // Send the command to get temperatures
+  float tempC = sensors.getTempCByIndex(0);
+
+  return tempC;
+}
+
+float ph_metre(float sicaklik){
+  temperature = sicaklik; 
+  static unsigned long timepoint = millis();
+	if (millis() - timepoint > 1000U) //time interval: 1s
+	{
+		timepoint = millis();
+		//voltage = rawPinValue / esp32ADC * esp32Vin
+		voltage = analogRead(PH_PIN) / ESPADC * ESPVOLTAGE; // read the voltage
+
+		phValue = ph.readPH(voltage, temperature); // convert voltage to pH with temperature compensation
+	
+	}
+	ph.calibration(voltage, temperature); // calibration process by Serail CMD
+  return phValue;
+}
+
+float mq135_CO(){
+  MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+
+  MQ135.setA(605.18); MQ135.setB(-3.937); // Configure the equation to calculate CO concentration value
+  float CO = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+  delay(500); //Sampling frequency
+  return CO;
+}
+
+float mq135_CO2(){
+  MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+
+  MQ135.setA(110.47); MQ135.setB(-2.862); // Configure the equation to calculate CO2 concentration value
+  float CO2 = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+  delay(500);
+  return CO2;
+}
+
+float mq135_NH4(){
+  MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+
+  MQ135.setA(102.2 ); MQ135.setB(-2.473); // Configure the equation to calculate NH4 concentration value
+  float NH4 = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+  delay(500);
+  return NH4;
+}
+
+void setup() {
+  Wire.begin();
+  Serial.begin(115200);
+  Wire.beginTransmission(si7021Addr);
+  Wire.endTransmission();
+
+  MQ135.setRegressionMethod(1); //_PPM =  a*ratio^b
+  MQ135.init(); 
+
+  EEPROM.begin(32);//needed to permit storage of calibration value in eeprom
+	ph.begin();
+
+  sensors.begin(); // dsb1820
+  pinMode(TdsSensorPin, INPUT);
+  delay(500);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED){
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  Serial.print("Connected with IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.println();
+
+  /* Assign the api key (required) */
+  config.api_key = API_KEY;
+
+  /* Assign the RTDB URL (required) */
+  config.database_url = DATABASE_URL;
+
+  /* Sign up */
+  if (Firebase.signUp(&config, &auth, "", "")){
+    Serial.println("ok");
+    signupOK = true;
+  }
+  else{
+    Serial.printf("%s\n", config.signer.signupError.message.c_str());
+  }
+
+  /* Assign the callback function for the long running token generation task */
+  config.token_status_callback = tokenStatusCallback; //see addons/TokenHelper.h
+  
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+ //___________________________________________-----
+ Serial.print("Calibrating please wait.");
+  float calcR0 = 0;
+  for(int i = 1; i<=10; i ++)
+  {
+    MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+    calcR0 += MQ135.calibrate(RatioMQ135CleanAir);
+    Serial.print(".");
+  }
+  MQ135.setR0(calcR0/10);
+  Serial.println("  done!.");
+  
+  if(isinf(calcR0)) {Serial.println("Warning: Conection issue, R0 is infinite (Open circuit detected) please check your wiring and supply"); while(1);}
+  if(calcR0 == 0){Serial.println("Warning: Conection issue found, R0 is zero (Analog pin shorts to ground) please check your wiring and supply"); while(1);}
+  /*****************************  MQ CAlibration ********************************************/ 
+  Serial.println("** Values from MQ-135 ****");
+  Serial.println("|    CO   |     CO2  |   NH4   |");  
+  //_____________________________________________________-
+
+  pinMode(SU,OUTPUT);
+  pinMode(FAN,OUTPUT);
+  pinMode(PH,OUTPUT);
+  pinMode(GUBRE,OUTPUT);
+
+  digitalWrite(SU,HIGH);
+  digitalWrite(FAN,HIGH);
+  digitalWrite(PH,HIGH);
+  digitalWrite(GUBRE,HIGH);
+
+}
+
+void loop() {
+
+  float sicaklik = si7021_sicaklik();
+  float nem = si7021_nem();
+  float siviSicak= sivi_sicaklik();
+  float pH = ph_metre(siviSicak);
+  float CO = mq135_CO();
+  float CO2 = mq135_CO2();
+  float NH4 = mq135_NH4();
+  float tds = tdsMtr(siviSicak);
+  
+
+
+  Serial.print("Sıvı Sicaklik : ");
+  Serial.print(siviSicak);
+  Serial.println(" C ");
+  delay(1000);
+
+
+  Serial.print("Ortam NEM : ");
+  Serial.println(nem);
+  delay(1000);
+
+  Serial.print("Ortam Sıcaklık ");
+  Serial.print("Celsius : ");
+  Serial.print(sicaklik);
+  Serial.println(" C ");
+
+ 	Serial.print("pH Değeri:");
+	Serial.println(pH, 4);
+  delay(1000);
+
+ 
+  Serial.print("|CO:   "); Serial.print(CO); 
+  Serial.print("   |CO2   "); Serial.print(CO2 + 400); 
+  Serial.print("   |NH4:   "); Serial.print(NH4); 
+  Serial.println("   |"); 
+
+  int flag_tds = 150;
+  while (flag_tds) {
+    tds = tdsMtr(siviSicak);
+    if (tds != 0) {
+      flag_tds--;
+    }
+    if (flag_tds <= 0)
+      break;
+  }
+
+  Serial.print("TDS ");
+  Serial.print(tds);
+  Serial.println(" ppm ");
+
+
+  if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > 8000 || sendDataPrevMillis == 0)){
+    sendDataPrevMillis = millis();
+    // Write an Int number on the database path test/int
+    if (Firebase.RTDB.setInt(&fbdo, "test/nem", nem)){
+      Serial.println("PASSED");
+      Serial.println("PATH: " + fbdo.dataPath());
+      Serial.println("TYPE: " + fbdo.dataType());
+    }
+    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdo.errorReason());
+    }
+    count++;
+    
+    // Write an Float number on the database path test/float
+    if (Firebase.RTDB.setFloat(&fbdo, "test/Su Sicakligi", siviSicak )){
+      Serial.println("PASSED");
+      Serial.println("PATH: " + fbdo.dataPath());
+      Serial.println("TYPE: " + fbdo.dataType());
+    }
+    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdo.errorReason());
+    }
+     // Write an Float number on the database path test/float
+    if (Firebase.RTDB.setFloat(&fbdo, "test/sicaklik", sicaklik )){
+      Serial.println("PASSED");
+      Serial.println("PATH: " + fbdo.dataPath());
+      Serial.println("TYPE: " + fbdo.dataType());
+    }
+    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdo.errorReason());
+    }
+     // Write an Float number on the database path test/tds
+    if (Firebase.RTDB.setFloat(&fbdo, "test/pH", pH)){
+      Serial.println("PASSED");
+      Serial.println("PATH: " + fbdo.dataPath());
+      Serial.println("TYPE: " + fbdo.dataType());
+    }
+    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdo.errorReason());
+    }
+    if (Firebase.RTDB.setFloat(&fbdo, "test/CO", CO)){
+      Serial.println("PASSED");
+      Serial.println("PATH: " + fbdo.dataPath());
+      Serial.println("TYPE: " + fbdo.dataType());
+    }
+    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdo.errorReason());
+    }
+    if (Firebase.RTDB.setFloat(&fbdo, "test/CO2", CO2+400)){
+      Serial.println("PASSED");
+      Serial.println("PATH: " + fbdo.dataPath());
+      Serial.println("TYPE: " + fbdo.dataType());
+    }
+    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdo.errorReason());
+    }
+    if (Firebase.RTDB.setFloat(&fbdo, "test/NH4", NH4)){
+      Serial.println("PASSED");
+      Serial.println("PATH: " + fbdo.dataPath());
+      Serial.println("TYPE: " + fbdo.dataType());
+    }
+    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdo.errorReason());
+    }
+     if (Firebase.RTDB.setFloat(&fbdo, "test/TDS", tds)){
+      Serial.println("PASSED");
+      Serial.println("PATH: " + fbdo.dataPath());
+      Serial.println("TYPE: " + fbdo.dataType());
+    }
+    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdo.errorReason());
+    }
+  }
+
+
+  if(sicaklik>26 || siviSicak >26){
+    digitalWrite(FAN,LOW);
+    Serial.println("SICAKLIK DUSTU FAN ACILDI");
+    delay(5000);
+    digitalWrite(FAN,HIGH);
+  }
+  if(tds<200){
+    digitalWrite(GUBRE,LOW);
+    Serial.println("GUBRE DUSTU MOTOR ACILDI");
+    delay(7000);
+    digitalWrite(GUBRE,HIGH);
+  }
+  if(pH<5){
+    digitalWrite(PH,LOW);
+    Serial.println("PH DUSTU MOTOR ACILDI");
+    delay(6000);
+    digitalWrite(PH,HIGH);
+  }
+  sayac = sayac + 1;
+  if(sayac >= 4){
+    sayac = 0;
+    digitalWrite(SU,LOW);
+    Serial.println("oksijenlendirme / suyu havalandirma / ");
+    delay(7000);
+    digitalWrite(SU,HIGH);
+  }
+
+
+}
