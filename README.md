@@ -1,7 +1,7 @@
 # y3s-embedded
 esp32 and sensors
 
-need micro controller board
+needed micro controller board
 esp32 s2 wroom 38 pin
 
 needed libraries and versions under below
